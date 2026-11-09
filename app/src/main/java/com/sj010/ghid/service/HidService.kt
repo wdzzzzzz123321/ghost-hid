@@ -76,6 +76,15 @@ class HidService : Service() {
     )
     private val timeFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
 
+    // msnav: 短按的“延迟松开”改用独立的定时器，绝不在发送线程里 sleep。
+    private val releaseScheduler =
+        java.util.concurrent.ScheduledThreadPoolExecutor(1).apply {
+            removeOnCancelPolicy = true
+        }
+
+    // 命令代次号：定时松开只在期间没有更新命令时才生效。
+    private val pressGeneration = java.util.concurrent.atomic.AtomicLong(0)
+
     private var adapter: BluetoothAdapter? = null
     private var hidDevice: BluetoothHidDevice? = null
     private var targetDevice: BluetoothDevice? = null
@@ -672,43 +681,47 @@ class HidService : Service() {
         val hid = hidDevice ?: return
         val target = targetDevice ?: return
         val allZero = bytes.all { it == 0.toByte() }
+        // 每条命令一个代次号：定时释放只在“期间没有更新的命令”时才执行，
+        // 避免旧的延迟释放把后来的按键状态一起清掉。
+        val generation = pressGeneration.incrementAndGet()
 
-        // ---- msnav: holdMs <= 0 表示“一直按住”，不 sleep、不自动松开 ----
-        // 用来做连续攻击/走位。松开由显式的全零报文、客户端断开、或看门狗负责。
-        // 这条路径绝不能 Thread.sleep：executor 只有 1 个线程，一旦在这里睡，
-        // 后续所有报文都会排队，暂停后仍在输出的现象就是这么来的。
-        if (holdMs <= 0L) {
-            executor.execute {
-                val ok = hid.sendReport(target, reportId, bytes)
-                log("sendReport(id=$reportId, hold=forever) returned: $ok")
-                if (allZero) {
-                    heldReportId = -1
-                } else if (reportId == KEYBOARD_REPORT_ID ||
+        // ---- msnav: 所有发送都在这里，执行器里【绝不 sleep】 ----
+        // executor 只有 1 个线程。旧实现用 Thread.sleep(holdMs) 做“按住一会再松”，
+        // 每条报文独占线程 holdMs；转向脉冲 75ms、攻击保持 1800ms，多怪时转向
+        // 一密集，队列就无限积压 —— 表现就是“刚开始快、越打越慢、来不及出手”。
+        // 现在改成：发送即返回，松开交给 ScheduledExecutor 在 holdMs 后补发。
+        executor.execute {
+            val ok = hid.sendReport(target, reportId, bytes)
+            val holdDesc = if (holdMs <= 0L) "forever" else "${holdMs}ms"
+            log("sendReport(id=$reportId, hold=$holdDesc) returned: $ok")
+            if (allZero) {
+                heldReportId = -1
+            } else if (holdMs <= 0L &&
+                (reportId == KEYBOARD_REPORT_ID ||
                     reportId == CONSUMER_REPORT_ID ||
-                    reportId == SYSTEM_REPORT_ID
-                ) {
-                    heldReportId = reportId
-                    heldReportSize = bytes.size
-                }
+                    reportId == SYSTEM_REPORT_ID)
+            ) {
+                heldReportId = reportId
+                heldReportSize = bytes.size
             }
-            return
         }
 
-        executor.execute {
-            log(">>> Executing Raw Report ID $reportId (${bytes.size} bytes, hold=${holdMs}ms)...")
-            val ok = hid.sendReport(target, reportId, bytes)
-            log("sendReport(id=$reportId) returned: $ok")
-            if (allZero) {
-                // 显式全零：键盘状态已全部释放，清掉“按住”标记。
-                heldReportId = -1
-                return@execute
-            }
-            // Momentary button auto-release for Consumer Control (0x04), System Control (0x03), and Keyboard (0x01)
-            if (reportId == CONSUMER_REPORT_ID || reportId == SYSTEM_REPORT_ID || reportId == KEYBOARD_REPORT_ID) {
-                try { Thread.sleep(holdMs) } catch (ignored: Exception) {}
-                val zero = ByteArray(bytes.size)
-                val okUp = hid.sendReport(target, reportId, zero)
-                log("sendReport(id=$reportId) auto-release returned: $okUp")
+        // 短按类（方向脉冲、药水、单次 tap）：定时补发全零松开，不阻塞发送线程。
+        if (holdMs > 0L && !allZero &&
+            (reportId == CONSUMER_REPORT_ID ||
+                reportId == SYSTEM_REPORT_ID ||
+                reportId == KEYBOARD_REPORT_ID)
+        ) {
+            try {
+                releaseScheduler.schedule({
+                    if (pressGeneration.get() == generation) {
+                        executor.execute {
+                            hid.sendReport(target, reportId, ByteArray(bytes.size))
+                            log("sendReport(id=$reportId) scheduled release (gen=$generation)")
+                        }
+                    }
+                }, holdMs, TimeUnit.MILLISECONDS)
+            } catch (ignored: Exception) {
             }
         }
     }
@@ -1538,6 +1551,9 @@ class HidService : Service() {
         // 先关 socket，避免服务销毁后仍接受新连接。
         stopSocketServer()
 
+        try {
+            releaseScheduler.shutdownNow()
+        } catch (ignored: Exception) {}
         try {
             executor.shutdown()
         } catch (ignored: Exception) {}
