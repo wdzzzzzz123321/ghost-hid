@@ -671,17 +671,60 @@ class HidService : Service() {
     fun sendRawReport(reportId: Int, bytes: ByteArray, holdMs: Long = 60L) {
         val hid = hidDevice ?: return
         val target = targetDevice ?: return
+        val allZero = bytes.all { it == 0.toByte() }
+
+        // ---- msnav: holdMs <= 0 表示“一直按住”，不 sleep、不自动松开 ----
+        // 用来做连续攻击/走位。松开由显式的全零报文、客户端断开、或看门狗负责。
+        // 这条路径绝不能 Thread.sleep：executor 只有 1 个线程，一旦在这里睡，
+        // 后续所有报文都会排队，暂停后仍在输出的现象就是这么来的。
+        if (holdMs <= 0L) {
+            executor.execute {
+                val ok = hid.sendReport(target, reportId, bytes)
+                log("sendReport(id=$reportId, hold=forever) returned: $ok")
+                if (allZero) {
+                    heldReportId = -1
+                } else if (reportId == KEYBOARD_REPORT_ID ||
+                    reportId == CONSUMER_REPORT_ID ||
+                    reportId == SYSTEM_REPORT_ID
+                ) {
+                    heldReportId = reportId
+                    heldReportSize = bytes.size
+                }
+            }
+            return
+        }
+
         executor.execute {
             log(">>> Executing Raw Report ID $reportId (${bytes.size} bytes, hold=${holdMs}ms)...")
             val ok = hid.sendReport(target, reportId, bytes)
             log("sendReport(id=$reportId) returned: $ok")
+            if (allZero) {
+                // 显式全零：键盘状态已全部释放，清掉“按住”标记。
+                heldReportId = -1
+                return@execute
+            }
             // Momentary button auto-release for Consumer Control (0x04), System Control (0x03), and Keyboard (0x01)
-            if ((reportId == CONSUMER_REPORT_ID || reportId == SYSTEM_REPORT_ID || reportId == KEYBOARD_REPORT_ID) && bytes.any { it != 0.toByte() }) {
-                try { Thread.sleep(if (holdMs > 0) holdMs else 60L) } catch (ignored: Exception) {}
+            if (reportId == CONSUMER_REPORT_ID || reportId == SYSTEM_REPORT_ID || reportId == KEYBOARD_REPORT_ID) {
+                try { Thread.sleep(holdMs) } catch (ignored: Exception) {}
                 val zero = ByteArray(bytes.size)
                 val okUp = hid.sendReport(target, reportId, zero)
                 log("sendReport(id=$reportId) auto-release returned: $okUp")
             }
+        }
+    }
+
+    /** msnav: 立即松开当前“一直按住”的按键（断开 / 看门狗 / 停止时调用）。 */
+    private fun releaseHeldKeysNow(reason: String) {
+        val id = heldReportId
+        if (id < 0) return
+        heldReportId = -1
+        val hid = hidDevice ?: return
+        val target = targetDevice ?: return
+        try {
+            hid.sendReport(target, id, ByteArray(heldReportSize.coerceAtLeast(1)))
+            log("Held keys released ($reason)")
+        } catch (e: Exception) {
+            log("Held-key release failed ($reason): ${e.message}")
         }
     }
 
@@ -1302,6 +1345,18 @@ class HidService : Service() {
     @Volatile
     private var socketServerRunning = false
 
+    // ---- msnav: 持续按住的按键状态 -------------------------------------
+    // holdMs <= 0 的 raw 表示“一直按住”，不自动松开。记住当前按住的是哪个
+    // report，好在客户端断开或长时间无命令时强制松开，避免按键卡死。
+    @Volatile
+    private var heldReportId = -1
+
+    @Volatile
+    private var heldReportSize = 8
+
+    @Volatile
+    private var lastClientCommandAt = 0L
+
     private fun startSocketServer(port: Int = SOCKET_BRIDGE_PORT) {
         if (socketServerRunning) return
         socketServerRunning = true
@@ -1324,10 +1379,30 @@ class HidService : Service() {
                 log("Socket bridge error: ${e.message}")
             }
         }, "ghid-socket-server").apply { isDaemon = true }.start()
+
+        // 看门狗：PC 每 800ms 会刷新一次心跳（哪怕只是重复同一条“按住”指令）。
+        // 若超过 2 秒一条命令都没收到，说明 PC 挂了/网络断了，立刻松开按键。
+        Thread({
+            while (socketServerRunning) {
+                try {
+                    Thread.sleep(300)
+                } catch (ignored: InterruptedException) {
+                    break
+                }
+                val held = heldReportId
+                if (held >= 0 &&
+                    android.os.SystemClock.elapsedRealtime() - lastClientCommandAt > 2000L
+                ) {
+                    log("Watchdog: no command for 2s, releasing held key(s)")
+                    releaseHeldKeysNow("watchdog timeout")
+                }
+            }
+        }, "ghid-socket-watchdog").apply { isDaemon = true }.start()
     }
 
     private fun stopSocketServer() {
         socketServerRunning = false
+        releaseHeldKeysNow("socket server stopping")
         try {
             socketServer?.close()
         } catch (ignored: Exception) {}
@@ -1348,6 +1423,8 @@ class HidService : Service() {
                     val line = reader.readLine() ?: break
                     val text = line.trim()
                     if (text.isEmpty()) continue
+                    // 心跳时间戳：看门狗据此判断 PC 是否还活着。
+                    lastClientCommandAt = android.os.SystemClock.elapsedRealtime()
                     val parts = text.split(Regex("\\s+"))
                     val reply = when (parts[0].lowercase(Locale.ROOT)) {
                         "ping" -> "PONG"
@@ -1390,6 +1467,11 @@ class HidService : Service() {
             }
         } catch (e: Exception) {
             log("Socket client error: ${e.message}")
+        } finally {
+            // 客户端断开（PC 进程被杀 / 网线断了）：立刻松开所有“一直按住”的键，
+            // 否则角色会一直朝一个方向跑或一直攻击。这是“终止 bat 后还在输出”
+            // 的根治手段——TCP 断开是最可靠的信号。
+            releaseHeldKeysNow("socket disconnected")
         }
     }
 
