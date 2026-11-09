@@ -64,6 +64,16 @@ jobs:
       - name: Build release APK
         run: ./gradlew :app:assembleRelease --no-daemon --info
 
+      # msnav: 手动构建时也要能直接下载 APK。
+      # 原流程只在失败时上传 fallback，成功产物只进 Release（需要打 tag）。
+      - name: Upload APK (manual build)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghost-hid-apk
+          path: app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+
       - name: Verify APK signature
         run: |
           set -euo pipefail

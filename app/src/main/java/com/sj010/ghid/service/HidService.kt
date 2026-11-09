@@ -40,8 +40,15 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import java.io.BufferedReader
+import java.io.BufferedWriter
 import java.io.File
 import java.io.FileWriter
+import java.io.InputStreamReader
+import java.io.OutputStreamWriter
+import java.net.ServerSocket
+import java.net.Socket
+import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -135,6 +142,8 @@ class HidService : Service() {
         const val MOUSE_REPORT_ID = 2
         const val SYSTEM_REPORT_ID = 3
         const val CONSUMER_REPORT_ID = 4
+        /** msnav: LAN socket bridge port (Termux 用的是 18080). */
+        const val SOCKET_BRIDGE_PORT = 18081
         private val RELEASE_REPORT = ByteArray(4)
 
         // A click must be long enough for every host stack to sample it, and
@@ -234,6 +243,7 @@ class HidService : Service() {
 
         log("GhostHID Service started.")
         initBluetooth()
+        startSocketServer()
     }
 
     fun resolveEffectiveOs(): TargetOs {
@@ -1272,6 +1282,127 @@ class HidService : Service() {
         }
     }
 
+    // ------------------------------------------------------------------
+    // LAN socket bridge (msnav)
+    //
+    // 让 PC 通过 TCP 直接下发 HID 报告，绕开 `am broadcast` 的进程启动开销
+    // （实测手机链路上这一步占 220ms，是按键延迟的绝对大头）。
+    //
+    // 协议：一行一条 UTF-8 文本，回复一行。
+    //     ping                  -> PONG
+    //     status                -> STATUS connected=.. os=.. target=..
+    //     raw <hex> <hold_ms>   -> OK / ERR <reason>
+    //     release               -> OK（全零报告，松开所有键）
+    //
+    // `raw` 的 hex 是 8 字节键盘报告（modifier, reserved, key1..key6），
+    // 与 Termux 版 udp_hid_server 完全一致，PC 侧不用改协议。
+    // ------------------------------------------------------------------
+    private var socketServer: ServerSocket? = null
+
+    @Volatile
+    private var socketServerRunning = false
+
+    private fun startSocketServer(port: Int = SOCKET_BRIDGE_PORT) {
+        if (socketServerRunning) return
+        socketServerRunning = true
+        Thread({
+            try {
+                val server = ServerSocket(port)
+                socketServer = server
+                log("Socket bridge listening on 0.0.0.0:$port")
+                while (socketServerRunning && !server.isClosed) {
+                    val client = try {
+                        server.accept()
+                    } catch (e: Exception) {
+                        break
+                    }
+                    Thread({ handleSocketClient(client) }, "ghid-socket-client")
+                        .apply { isDaemon = true }
+                        .start()
+                }
+            } catch (e: Exception) {
+                log("Socket bridge error: ${e.message}")
+            }
+        }, "ghid-socket-server").apply { isDaemon = true }.start()
+    }
+
+    private fun stopSocketServer() {
+        socketServerRunning = false
+        try {
+            socketServer?.close()
+        } catch (ignored: Exception) {}
+        socketServer = null
+    }
+
+    private fun handleSocketClient(client: Socket) {
+        try {
+            client.use { socket ->
+                socket.tcpNoDelay = true
+                val reader = BufferedReader(
+                    InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8)
+                )
+                val writer = BufferedWriter(
+                    OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8)
+                )
+                while (true) {
+                    val line = reader.readLine() ?: break
+                    val text = line.trim()
+                    if (text.isEmpty()) continue
+                    val parts = text.split(Regex("\\s+"))
+                    val reply = when (parts[0].lowercase(Locale.ROOT)) {
+                        "ping" -> "PONG"
+                        "status" -> buildStatusLine()
+                        "release" -> {
+                            handleIntent(
+                                Intent().apply {
+                                    putExtra("cmd", "raw")
+                                    putExtra("hex", "0000000000000000")
+                                    putExtra("hold_ms", 60L)
+                                    putExtra("id", KEYBOARD_REPORT_ID)
+                                }
+                            )
+                            "OK"
+                        }
+                        "raw" -> {
+                            if (parts.size < 3) {
+                                "ERR args"
+                            } else if (hidDevice == null || targetDevice == null) {
+                                // 明确回报，避免 PC 侧把“没连上”误判成“已发送”。
+                                "ERR no-hid"
+                            } else {
+                                handleIntent(
+                                    Intent().apply {
+                                        putExtra("cmd", "raw")
+                                        putExtra("hex", parts[1])
+                                        putExtra("hold_ms", parts[2].toLongOrNull() ?: 60L)
+                                        putExtra("id", KEYBOARD_REPORT_ID)
+                                    }
+                                )
+                                "OK"
+                            }
+                        }
+                        else -> "ERR cmd"
+                    }
+                    writer.write(reply)
+                    writer.write("\n")
+                    writer.flush()
+                }
+            }
+        } catch (e: Exception) {
+            log("Socket client error: ${e.message}")
+        }
+    }
+
+    private fun buildStatusLine(): String {
+        val connected = _connectionState.value == ConnectionStatus.CONNECTED
+        val name = try {
+            targetDevice?.name
+        } catch (e: SecurityException) {
+            null
+        } ?: "-"
+        return "STATUS connected=$connected os=${resolveEffectiveOs().token} target=$name"
+    }
+
     override fun onBind(intent: Intent?): IBinder = binder
 
     private fun teardown() {
@@ -1321,6 +1452,9 @@ class HidService : Service() {
         _isRegistered.value = false
         stopOsDetection()
         writeStatusFile()
+
+        // 先关 socket，避免服务销毁后仍接受新连接。
+        stopSocketServer()
 
         try {
             executor.shutdown()
